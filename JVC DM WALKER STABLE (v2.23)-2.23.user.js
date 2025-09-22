@@ -3,60 +3,86 @@
 // @namespace    https://tampermonkey.net/
 // @version      2.23
 // @description  Last page via max-number → true random user → 96h cooldown → MP all_dest. Compose-first, compact EN UI, forum scope (18-25 & Finance, 85/15), cooldown-left logs, human-like scroll/hover. Forum lists forced to page 1. URLs in message are pasted (not typed). UI mounting robust & private storage.
-// @match        *://*.jeuxvideo.com/*
-// @run-at       document-end
+// @match        https://www.jeuxvideo.com/forums/*
+// @match        https://www.jeuxvideo.com/messages-prives/nouveau.php*
+// @match        https://www.jeuxvideo.com/messages-prives/message.php*
+// @match        https://www.jeuxvideo.com/login*
+// @match        https://www.jeuxvideo.com/
+// @run-at       document-idle
 // @grant        GM.getValue
 // @grant        GM.setValue
 // @grant        GM.addValueChangeListener
+// @grant        GM.listValues
+// @grant        GM.deleteValue
 // ==/UserScript==
 (async function () {
   'use strict';
 
-  /* ====== stockage persistant et privé ====== */
+const DEBUG = false;
+
+  function sanitizeForLog(input) {
+    if (typeof input === 'string') {
+      return input.replace(/(token|password|pass|auth)=([^&\s]+)/gi, '$1=***');
+    }
+    if (input && typeof input === 'object') {
+      try {
+        return JSON.parse(JSON.stringify(input, (k, v) => /token|password|pass|auth/i.test(k) ? '***' : v));
+      } catch (e) {
+        return '[object]';
+      }
+    }
+    return input;
+  }
+
+  /* ====== persistent private storage ====== */
+  const STORE_TTL = 96*3600*1000;
+  const TS_SUFFIX = '__ts';
   const get = async (k, d) => {
     try { return await GM.getValue(k, d); }
-    catch (err) { console.error('GM.getValue:', err); return d; }
+    catch (err) { log('GM.getValue:', err); return d; }
   };
   const set = async (k, v) => {
-    try { await GM.setValue(k, v); }
-    catch (err) { console.error('GM.setValue:', err); }
+    try {
+      await GM.setValue(k, v);
+      if (v === null || v === undefined) {
+        await GM.deleteValue(k + TS_SUFFIX);
+      } else {
+        await GM.setValue(k + TS_SUFFIX, Date.now());
+      }
+    }
+    catch (err) { log('GM.setValue:', err); }
   };
+  async function purgeStore(){
+    try {
+      const keys = await GM.listValues();
+      const now = Date.now();
+      for(const k of keys){
+        if(k.endsWith(TS_SUFFIX)) continue;
+        const ts = await GM.getValue(k + TS_SUFFIX, 0);
+        if(ts && now - ts > STORE_TTL){
+          await GM.deleteValue(k);
+          await GM.deleteValue(k + TS_SUFFIX);
+        }
+      }
+    } catch(err) {
+      console.error('GM.listValues:', err);
+    }
+  }
+  await purgeStore();
 
   /* ---------- utils ---------- */
   const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
   const rnd=(a,b)=>a+Math.random()*(b-a);
   const human=()=>sleep(Math.round(rnd(49,105)));
   const dwell=(a=350,b=950)=>sleep(Math.round(rnd(a,b)));
-    async function randomScrollWait(min,max){
-    if (min >= max) [min, max] = [max, min];
-    min = Math.max(min, 0);
-    const end = NOW() + Math.round(rnd(min,max));
-    while(NOW() < end){
-      if(Math.random()<0.3){
-        try{ window.scrollBy({top:rnd(-120,120),behavior:'smooth'}); }
-        catch(e){ console.error('[randomScrollWait]', e); }
-      }
-      await dwell(400,1200);
-    }
-  }
+
+  /**
+   * Attend une durée aléatoire entre `min` et `max` en simulant des scrolls.
+   * Si `min >= max`, les valeurs sont permutées pour garantir un intervalle valide.
+   * Le paramètre `min` est borné à `0` pour éviter les valeurs négatives.
+   */
+
   async function randomScrollWait(min,max){
-  if (min >= max) [min, max] = [max, min];
-    min = Math.max(min, 0);
-    const end = NOW() + Math.round(rnd(min,max));
-    while(NOW() < end){
-      if(Math.random()<0.3){
-        try{ window.scrollBy({top:rnd(-120,120),behavior:'smooth'}); }
-        catch(e){ console.error('[randomScrollWait]', e); }
-      }
-      await dwell(400,1200);
-    }
-  }
- /**
-  * Attend une durée aléatoire entre `min` et `max` en simulant des scrolls.
-  * Si `min >= max`, les valeurs sont permutées pour garantir un intervalle valide.
-  * Le paramètre `min` est borné à `0` pour éviter les valeurs négatives.
-  */
- async function randomScrollWait(min,max){
     if (min >= max) [min, max] = [max, min];
     min = Math.max(min, 0);
     const end = NOW() + Math.round(rnd(min,max));
@@ -67,6 +93,44 @@
       }
       await dwell(400,1200);
     }
+  }
+    const clamp=y=>{
+    const maxY=document.documentElement.scrollHeight-window.innerHeight;
+    return Math.min(Math.max(0,y),maxY);
+  };
+
+  async function readingScroll(){
+    const maxY = document.documentElement.scrollHeight - window.innerHeight;
+    let cancel = false;
+    const cancelFn = () => { cancel = true; };
+    const events = ['wheel','mousedown','keydown','touchstart'];
+    events.forEach(e => window.addEventListener(e, cancelFn, {once:true}));
+    const start = Date.now();
+    const MAX_TIME = 60000;
+    let iter = 0;
+    try{
+      while(!cancel && window.scrollY < maxY && (Date.now() - start) < MAX_TIME && iter < 60){
+        await smoothScrollTo(Math.min(window.scrollY + rnd(80,160), maxY));
+        await dwell(400,900);
+        iter++;
+      }
+    } finally {
+      events.forEach(e => window.removeEventListener(e, cancelFn));
+    }
+  }
+  async function smoothScrollTo(targetY){
+    const maxY=document.documentElement.scrollHeight-window.innerHeight;
+    targetY=Math.min(Math.max(0,targetY),maxY);
+    let distance=targetY-window.scrollY;
+    let steps=0;
+    while(Math.abs(distance)>1 && steps++<1000){
+      const step=Math.max(1,Math.min(Math.abs(distance),rnd(40,80)));
+      window.scrollBy(0,step*Math.sign(distance));
+      await sleep(Math.round(rnd(30,60)));
+      distance=targetY-window.scrollY;
+    }
+    window.scrollTo(0,targetY);
+
   }
   const q=(s,r=document)=>r.querySelector(s);
   const qa=(s,r=document)=>Array.from(r.querySelectorAll(s));
@@ -75,8 +139,10 @@
 
 let chronoEl=null, statusEl=null, logEl=null, dmCountEl=null;
 
-  const logBuffer=[]; let logIdx=0; const log=(s)=>{
-    logBuffer[logIdx++ % 200] = s;
+  const logBuffer=[]; let logIdx=0; const log=(...args)=>{
+    if (!DEBUG) return;
+    const sanitized=args.map(sanitizeForLog);
+    logBuffer[logIdx++ % 200] = sanitized.join(' ');
     if(!logEl) logEl=q('#jvc-dmwalker-log');
     if(logEl){
     const idx=logIdx%200;
@@ -84,6 +150,7 @@ let chronoEl=null, statusEl=null, logEl=null, dmCountEl=null;
     logEl.textContent=ordered.filter(Boolean).join('\n');
     logEl.scrollTop=logEl.scrollHeight;
     }
+    console.log(...sanitized);
   };
 
   // keep track of the UI MutationObserver so it can be cleaned up
@@ -115,6 +182,18 @@ let chronoEl=null, statusEl=null, logEl=null, dmCountEl=null;
 
     }
     window.addEventListener('unload', cleanupUI);
+
+    const reinit = async () => {
+      const on = await GM.getValue(STORE_ON, false);
+      if (on) {
+        log('[DM_WALKER] pageshow/popstate → reinit');
+        try { await ensureUI(); }
+        catch (e) { log('[DM Walker] UI error', e); }
+        tickSoon(400);
+      }
+    };
+    window.addEventListener('pageshow', () => { reinit().catch(log); });
+    window.addEventListener('popstate', () => { reinit().catch(log); });
   }
 
   function setVal(el,v){
@@ -188,19 +267,15 @@ let chronoEl=null, statusEl=null, logEl=null, dmCountEl=null;
       let rect=el.getBoundingClientRect?.();
       if(!rect) return;
       const targetY = window.scrollY + rect.top - window.innerHeight/2 + rnd(-80,80);
-      const behavior = Math.random()<0.5 ? 'smooth' : 'instant';
-      try{ window.scrollTo({top: Math.max(0,targetY), behavior}); }
-      catch(e){ console.error('[humanHover] initial scrollTo', e); window.scrollTo(0, Math.max(0,targetY)); }
+      await smoothScrollTo(clamp(targetY));
       await sleep(200+Math.random()*300);
       if(Math.random()<0.3){
         const dir = targetY > window.scrollY ? 1 : -1;
         const overshoot = rnd(30,120);
-        const overY = Math.max(0, targetY + dir*overshoot);
-        try{ window.scrollTo({top:overY, behavior}); }
-        catch(e){ console.error('[humanHover] overshoot scrollTo', e); window.scrollTo(0,overY); }
+        const overY = clamp(targetY + dir*overshoot);
+        await smoothScrollTo(overY);
         await sleep(120+Math.random()*180);
-        try{ window.scrollTo({top: Math.max(0,targetY), behavior}); }
-        catch(e){ console.error('[humanHover] return scrollTo', e); window.scrollTo(0, Math.max(0,targetY)); }
+        await smoothScrollTo(clamp(targetY));
         await sleep(120+Math.random()*180);
       }
       const wheelCount = Math.floor(rnd(1,4));
@@ -209,8 +284,7 @@ let chronoEl=null, statusEl=null, logEl=null, dmCountEl=null;
         el.dispatchEvent(new WheelEvent('wheel',{bubbles:true,deltaY:delta}));
         await sleep(60+Math.random()*120);
       }
-      try{ window.scrollTo({top: Math.max(0,targetY), behavior}); }
-      catch(e){ console.error('[humanHover] final scrollTo', e); window.scrollTo(0, Math.max(0,targetY)); }
+      await smoothScrollTo(clamp(targetY));
       await sleep(120+Math.random()*180);
       rect=el.getBoundingClientRect?.();
       if(!rect) return;
@@ -221,7 +295,7 @@ let chronoEl=null, statusEl=null, logEl=null, dmCountEl=null;
         await sleep(40+Math.random()*90);
       }
       el.dispatchEvent(new MouseEvent('mouseover',{bubbles:true,clientX:cx,clientY:cy}));
-    }catch(e){ console.error('[humanHover]', e); }
+    }catch(e){ log('[humanHover]', e); }
     await dwell(120,260);
   }
 
@@ -240,22 +314,52 @@ let chronoEl=null, statusEl=null, logEl=null, dmCountEl=null;
   }
 
   /* ---------- state ---------- */
-  const STORE_CONF='jvc_mpwalker_conf';
+  const STORE_CONF='jvc_postwalker_conf';
   let confCache = null;
   async function loadConf(force=false){
-    if(force || confCache===null){ confCache = await get(STORE_CONF,{}); }
+    if(force || confCache===null){
+      confCache = await get(STORE_CONF,{});
+      if(!('activeSlots' in confCache) && Array.isArray(confCache.activeHours)){
+        const [h1,h2] = confCache.activeHours;
+        confCache.activeSlots = normalizeSlots([{start:h1*60,end:h2*60}]);
+        await set(STORE_CONF, confCache);
+      }
+    }
     return confCache;
   }
   async function saveConf(conf){
     await set(STORE_CONF,conf);
     confCache = conf;
   }
+    async function ensureDefaults(){
+    const cfg = await loadConf();
+    let changed = false;
+    if(!Array.isArray(cfg.accounts)){
+      cfg.accounts = [];
+      changed = true;
+    }
+    if(!cfg.accounts.length){
+      if(cfg.accountIdx !== 0){ cfg.accountIdx = 0; changed = true; }
+    } else if(cfg.accountIdx >= cfg.accounts.length){
+      cfg.accountIdx = 0;
+      changed = true;
+    }
+    if(changed) await saveConf(cfg);
+  }
   const STORE_SENT='jvc_mpwalker_sent';
   const STORE_ON='jvc_mpwalker_on';
   const STORE_LAST_LIST='jvc_mpwalker_last_list';
   const STORE_NAV_GUARD='jvc_mpwalker_nav_guard';
-  const STORE_SESSION='jvc_mpwalker_session';
+  const STORE_SESSION='jvc_postwalker_session';
+  const STORE_PENDING_LOGIN='jvc_postwalker_pending_login';
+  const STORE_LOGIN_REFUSED='jvc_postwalker_login_refused';
+  const STORE_LOGIN_ATTEMPTS='jvc_postwalker_login_attempts';
+  const STORE_LOGIN_BLOCKED='jvc_postwalker_login_blocked';
+  const STORE_CF_RETRIES='jvc_postwalker_cf_retries';
   const STORE_TARGET_FORUM='jvc_mpwalker_target_forum';
+
+  let loginReloadTimeout=null;
+  let loginAttempted=false;
 
   let onCache = false;
 let sessionCache = {active:false,startTs:0,stopTs:0,mpCount:0,mpNextDelay:Math.floor(rnd(2,5)),dmSent:0,pendingDm:false};
@@ -263,15 +367,24 @@ let sessionCacheLoaded = false;
   if(typeof GM !== 'undefined' && GM.addValueChangeListener){
     GM.addValueChangeListener(STORE_CONF, async () => {
       try { await loadConf(true); }
-      catch (e) { console.error('loadConf failed', e); }
+      catch (e) { log('loadConf failed', e); }
     });
-    GM.addValueChangeListener(STORE_ON, (_, __, v)=>{ onCache = v; updateSessionUI().catch(console.error); });
-    GM.addValueChangeListener(STORE_SESSION, (_, __, v)=>{ sessionCache = v; sessionCacheLoaded = true; updateSessionUI().catch(console.error); });
+    GM.addValueChangeListener(STORE_ON, (_, __, v)=>{ onCache = v; updateSessionUI().catch(log); });
+    GM.addValueChangeListener(STORE_SESSION, (_, __, v)=>{ sessionCache = v; sessionCacheLoaded = true; updateSessionUI().catch(log); });
     await loadConf(true);
   }
   onCache = await get(STORE_ON,false);
+  await ensureDefaults();
 
-  const DEFAULTS = { me:'', cooldownH:96, activeHours:[8,23] };
+  const pendingLogin = await get(STORE_PENDING_LOGIN,false);
+  if(pendingLogin){
+    await set(STORE_PENDING_LOGIN,false);
+    location.href='https://www.jeuxvideo.com/login';
+    return;
+  }
+
+  const DEFAULTS = { me:'', cooldownH:96, activeHours:[8,23], activeSlots:[], accounts:[], accountIdx:0 };
+  if(location.pathname.startsWith('/login') && !(await get(STORE_LOGIN_BLOCKED,false))) await autoLogin();
   // Source: hard blacklist provided by the DM Walker community
   // Last updated: 2025-08-22
   const HARD_BL = new Set([
@@ -435,10 +548,273 @@ let sessionCacheLoaded = false;
     'yoda_software',
     'zavvi',
     'zelprod',
-    'Superpanda',
+    'superpanda',
+    'mekonis',
+    'strangerfruit',
+    'pseudo supprim[ée]',
   ]);
 
-  const TITLE_BL = [/mod[ée]ration/i, /r[èe]gles/i];
+  // Farm accounts (hard blacklist)
+  const FARM_ACCOUNTS = [
+    'traknet',
+    'patochelapoche',
+    'aureliechiasse',
+    'luciechiasse',
+    'lauriechiasse',
+    'adelechiasse',
+    'karinechiasse',
+    'clarachiasse',
+    'ginettechiasse',
+    'emmachiasse',
+    'rosechiasse',
+    'alicechiasse',
+    'annachiasse',
+    'juliachiasse',
+    'agathechiasse',
+    'jeannechiasse',
+    'oliviachiasse',
+    'lenachiasse',
+    'chloechiasse',
+    'leoniechiasse',
+    'zoechiasse',
+    'leachiasse',
+    'lolachiasse',
+    'margotchiasse',
+    'purplefion',
+    'bluefion',
+    'redfion',
+    'greenfion',
+    'yellowfion',
+    'pinkfion',
+    'lavenderfion',
+    'orangefion',
+    'cyanfion',
+    'magnentafion',
+    'saumonfion',
+    'corailfion',
+    'chocolatefion',
+    'ardoisefion',
+    'ivoirefion',
+    'sablefion',
+    'bordeauxfion',
+    'goldenfion',
+    'pinkyfion',
+    'violetfion',
+  ];
+  FARM_ACCOUNTS.forEach(u => HARD_BL.add(u));
+
+  const TITLE_BL = [/(?:mod[ée]ration|moderation)/i, /(?:r[èe]gles|rules)/i];
+
+  const DM_LIMIT_ERRORS = [
+    "Vous avez atteint votre limite de création de discussions MP pour la journée. En savoir plus sur les niveaux utilisateurs.",
+    "You have reached your limit of creating DM conversations for the day. Learn more about user levels."
+  ];
+    function shouldSwitchAccountForDM(errorText){
+    const text=(errorText||'').replace(/\s+/g,' ').trim().toLowerCase();
+    return DM_LIMIT_ERRORS.some(msg=>text.includes(msg.toLowerCase()));
+  }
+
+  function observeAndHandleDMErrors(){
+    let debounce=null;
+    let switching=false;
+    const selector = [
+      '.alert--error',
+      '.alert.alert-danger',
+      '.msg-error',
+      '.alert-warning',
+      '.alert.alert-warning',
+      '.alert.alert-warning p.mb-0',
+      '.txt-msg-error',
+      '.flash-error'
+    ].join(', ');
+    const check=()=>{
+      const els=qa(selector);
+      for(const el of els){
+        const txt=el.innerText||el.textContent||'';
+        if(shouldSwitchAccountForDM(txt)){
+          if(!debounce){
+            debounce=setTimeout(()=>{
+              debounce=null;
+              if(!switching){
+                switching=true;
+                switchToNextAccount('DM_LIMIT_REACHED')
+                  .catch(log)
+                  .finally(()=>{switching=false;});
+              }
+            },200);
+          }
+          break;
+        }
+      }
+    };
+    const mo=new MutationObserver(check);
+    check(); // handle message already present at load
+    mo.observe(document.body,{childList:true,subtree:true});
+    return mo;
+  }
+
+  let dmErrorObserver = observeAndHandleDMErrors();
+  window.addEventListener('beforeunload', () => {
+    dmErrorObserver?.disconnect();
+    dmErrorObserver = null;
+  });
+
+  function hasCloudflareCaptcha(){
+    return q('#cf-challenge, .cf-turnstile, iframe[title*="Cloudflare" i]');
+  }
+
+  async function autoLogin(){
+    if(loginAttempted) return;
+    loginAttempted=true;
+    const blocked = await get(STORE_LOGIN_BLOCKED,false);
+    if(blocked){
+      if (DEBUG) console.warn('autoLogin: blocked after repeated failures');
+      return;
+    }
+    const blockUntil = await get(STORE_LOGIN_REFUSED,0);
+    const remaining = blockUntil - NOW();
+    if(remaining>0){
+      if (DEBUG) console.warn('autoLogin: login recently refused');
+      clearTimeout(loginReloadTimeout);
+      loginReloadTimeout=setTimeout(()=>location.reload(),remaining);
+      return;
+    }
+    if(loginReloadTimeout){ clearTimeout(loginReloadTimeout); loginReloadTimeout=null; }
+    if(hasCloudflareCaptcha()){
+      const retries = await get(STORE_CF_RETRIES,0);
+      if(retries>=3){
+        console.warn('autoLogin: Cloudflare challenge limit reached');
+        return;
+      }
+      await set(STORE_CF_RETRIES,retries+1);
+      await dwell();
+      clearTimeout(loginReloadTimeout);
+      loginReloadTimeout=setTimeout(()=>location.reload(),0);
+      return;
+    }
+    await set(STORE_CF_RETRIES,0);
+    const cfg = Object.assign({}, DEFAULTS, await loadConf());
+    const account = cfg.accounts?.[cfg.accountIdx];
+    if(!account) return;
+    const pseudoEl = q('input[name="login_pseudo"]');
+    const passEl = q('input[name="login_password"]');
+    if(!pseudoEl || !passEl) return;
+    if(pseudoEl.value !== account.user || passEl.value !== account.pass){
+      setValue(pseudoEl, '');
+      setValue(passEl, '');
+      await dwell(2000, 3000);
+      await typeHuman(pseudoEl, account.user);
+      await typeHuman(passEl, account.pass);
+    }
+      if(pseudoEl.value !== account.user || passEl.value !== account.pass){
+        if (DEBUG) console.warn('autoLogin: credential fill mismatch; forcing values');
+        setValue(pseudoEl, account.user);
+        setValue(passEl, account.pass);
+      }
+    const form = pseudoEl.closest('form') || passEl.closest('form');
+    if(!form){
+      if (DEBUG) console.warn('autoLogin: form not found');
+      return;
+    }
+    await dwell();
+    const btn = form.querySelector('button[type="submit"], input[type="submit"]');
+    try{
+      await humanHover(btn || form);
+      if(btn){
+        btn.click();
+      }else if(form.requestSubmit){
+        form.requestSubmit();
+      }else{
+        if (DEBUG) console.warn('autoLogin: no submission mechanism found');
+      }
+      const deadline = NOW() + 15000;
+      let sandboxCount = 0;
+      let sandboxSeen = 0;
+      while(NOW() < deadline && /login/i.test(location.pathname)){
+        await sleep(250);
+        const cf=q('#cf-challenge, .cf-turnstile');
+        const currentSandbox=qa('iframe[sandbox]').length;
+        if(!cf && currentSandbox > sandboxCount){
+          sandboxCount = currentSandbox;
+          sandboxSeen++;
+          if(sandboxSeen >= 3){
+            clearTimeout(loginReloadTimeout);
+            loginReloadTimeout=null;
+            alert('autoLogin: Cloudflare challenge impossible, intervention requise');
+            if (DEBUG) console.warn('autoLogin: Cloudflare challenge limit reached');
+            return;
+          }
+        }
+        if(cf){
+          const retries = await get(STORE_CF_RETRIES,0);
+          if(retries>=3){
+            console.warn('autoLogin: Cloudflare challenge limit reached');
+          }else{
+            await set(STORE_CF_RETRIES,retries+1);
+            await dwell();
+            clearTimeout(loginReloadTimeout);
+            loginReloadTimeout=setTimeout(()=>location.reload(),0);
+          }
+          return;
+        }
+        const errEl=q('.alert--error, .alert.alert-danger, .msg-error, .alert-warning');
+        if(errEl && /(?:Votre tentative de connexion a été refusée|Your login attempt was refused)/i.test(errEl.textContent)){
+          const attempts=(await get(STORE_LOGIN_ATTEMPTS,0))+1;
+          await set(STORE_LOGIN_ATTEMPTS,attempts);
+          if(attempts>=2){
+            await set(STORE_LOGIN_BLOCKED,true);
+            await set(STORE_LOGIN_REFUSED,0);
+            clearTimeout(loginReloadTimeout);
+            if (DEBUG) console.warn('autoLogin: login refused, blocking auto retries');
+            return;
+          }
+          const delay=rnd(10*60*1000,11*60*1000);
+          await set(STORE_LOGIN_REFUSED,NOW()+delay);
+          clearTimeout(loginReloadTimeout);
+          loginReloadTimeout=setTimeout(()=>location.reload(),delay);
+          if (DEBUG) console.warn('autoLogin: login refused, delaying retry');
+          return;
+        }
+      }
+      const errEl=q('.alert--error, .alert.alert-danger, .msg-error, .alert-warning');
+      if(errEl && /(?:Votre tentative de connexion a été refusée|Your login attempt was refused)/i.test(errEl.textContent)){
+        const attempts=(await get(STORE_LOGIN_ATTEMPTS,0))+1;
+        await set(STORE_LOGIN_ATTEMPTS,attempts);
+        if(attempts>=2){
+          await set(STORE_LOGIN_BLOCKED,true);
+          await set(STORE_LOGIN_REFUSED,0);
+          clearTimeout(loginReloadTimeout);
+          if (DEBUG) console.warn('autoLogin: login refused, blocking auto retries');
+          return;
+        }
+        const delay=rnd(10*60*1000,11*60*1000);
+        await set(STORE_LOGIN_REFUSED,NOW()+delay);
+        clearTimeout(loginReloadTimeout);
+        loginReloadTimeout=setTimeout(()=>location.reload(),delay);
+        if (DEBUG) console.warn('autoLogin: login refused, delaying retry');
+        return;
+      }
+      if(/login/i.test(location.pathname) && !errEl){
+        const attempts=(await get(STORE_LOGIN_ATTEMPTS,0))+1;
+        await set(STORE_LOGIN_ATTEMPTS,attempts);
+        const delay=attempts===1 ? rnd(10*60*1000,11*60*1000) : rnd(5*60*1000,6*60*1000);
+        await set(STORE_LOGIN_REFUSED,NOW()+delay);
+        clearTimeout(loginReloadTimeout);
+        loginReloadTimeout=setTimeout(()=>location.reload(),delay);
+        if (DEBUG) console.warn('autoLogin: login page unchanged, delaying retries');
+        return;
+      }
+      await set(STORE_LOGIN_ATTEMPTS,0);
+      await set(STORE_LOGIN_BLOCKED,false);
+      await set(STORE_LOGIN_REFUSED,0);
+      loginAttempted=false;
+    }
+    catch(err){
+      log('autoLogin: submission failed', err);
+    }
+  }
+
+  if(typeof window !== 'undefined') window.autoLogin = autoLogin;
 
   /* ---------- forums + weighted choice ---------- */
   const FORUMS = {
@@ -509,13 +885,13 @@ let sessionCacheLoaded = false;
     if(t) return t;
   }
   const hasSession = document.cookie.includes('md_sid=');
-  log(`Pseudo introuvable${hasSession ? ' — session détectée' : ' — aucune session détectée'}.`);
+  log(`Username not found${hasSession ? ' — session detected' : ' — no session detected'}.`);
   return '';
   }
   /* ---------- message templates ---------- */
   const TITLE_TEMPLATES = [
     "Besoin d'aide URGENT","HELP : besoin d'aide","Full RSA besoin d'aide",
-    "Aidez moi svp","Besoin d’aide FULL RSA","RSA je meurs","Survivre au RSA"
+    "Aidez moi svp","Besoin d’aide FULL RSA","RSA je meurs","Survivre au RSA", "GRATTONS"
   ];
   const TEXT_TEMPLATES = [`MODE SURVIE https://image.noelshack.com/fichiers/2016/36/1473263957-risitas33.png
 tqt c'est vraiment connu demande à chatgpt https://image.noelshack.com/fichiers/2016/48/1480465536-1475531584-risitascomplot.png
@@ -524,9 +900,12 @@ J’ai trouvé un "glitch" 100% LEGAL pour GRATTER de l’argent sur tous les si
 +1000€ économisés depuis que je l'utilise :d) https://www.noelshack.com/2025-34-5-1755868565-82fef769add4fa83b41483178426ef5c.png
 
 IGRAAAAAAAAAAL https://image.noelshack.com/fichiers/2021/43/4/1635454847-elton-john-tison-golem.png
-Quand tu commandes :d)  IGRAAL te redirige vers la boutique (amazon, aliexpress, uber eats, sfr, etc) https://image.noelshack.com/fichiers/2016/36/1473263957-risitas33.png
-Le site file une com à IGRAAL pour t’avoir amené comme client :d)  IGRAAL te reverse une partie https://image.noelshack.com/minis/2016/52/1483054124-risitas.png
-3€ à GRATTER lors de l'inscription :d)  https://fr.igraal.com/parrainage?parrain=AG_5ddf42495f191 https://image.noelshack.com/minis/2017/39/3/1506463228-risibg.png
+
+Quand tu commandes :d) IGRAAL te redirige vers la boutique (amazon, aliexpress, uber eats, sfr, etc)
+
+Le site file une com à IGRAAL pour t’avoir amené comme client :d) IGRAAL te reverse une partie https://image.noelshack.com/minis/2016/52/1483054124-risitas.png
+
+3€ à GRATTER lors de l'inscription :d) https://fr.igraal.com/parrainage?parrain=AG_5ddf42495f191
 
 oui je GRATTE aussi 3 balles https://image.noelshack.com/minis/2021/51/4/1640278497-2.png
 C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.com/minis/2019/11/6/1552755294-macronpetitpied2.png`];
@@ -584,7 +963,7 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
   }
   function getInfoFromHref(href){
     try{ const u=new URL(href, ORIG); return getTopicInfoFromPath(u.pathname); }
-    catch(e){ console.error('[getInfoFromHref]', e); return {forumId:null, topicId:null, page:NaN}; }
+    catch(e){ log('[getInfoFromHref]', e); return {forumId:null, topicId:null, page:NaN}; }
   }
   function currentTopicInfo(){ return getTopicInfoFromPath(location.pathname); }
 
@@ -616,7 +995,7 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
       const u=new URL(href, ORIG);
       const {fid} = getListInfoFromPath(u.pathname, u.search);
       return fid && ALLOWED_FORUMS.has(fid) ? forumListPageOneURL(fid) : pickListWeighted();
-    }catch(e){ console.error('[normalizeListToPageOne]', e); return pickListWeighted(); }
+    }catch(e){ log('[normalizeListToPageOne]', e); return pickListWeighted(); }
   }
 
   /* ---------- pagination : max-number (same topicId) ---------- */
@@ -633,7 +1012,7 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
       let n = /^\d+$/.test(txt) ? parseInt(txt,10) : info.page;
       if(!isNaN(n) && (isNaN(best.num) || n>best.num)){
         try{ best={el:a,num:n,abs:new URL(href,ORIG).href}; }
-        catch(e){ console.error('[findMaxPageLinkForCurrentTopic] URL parse', e); }
+        catch(e){ log('[findMaxPageLinkForCurrentTopic] URL parse', e); }
       }
     }
     return best;
@@ -713,6 +1092,7 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
     const offset = randInt(pool.length);
     for(let k=0;k<pool.length;k++){
       const p = pool[(k+offset)%pool.length];
+      if(bannedRecipients.has(p)){ log(`skip banned ${p}`); continue; }
       const key = await hashPseudo(p);
       const t = sent[key];
       if(t){
@@ -727,15 +1107,17 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
   }
 
   /* ---------- compose ---------- */
+  const bannedRecipients = new Set();
   const hasCF = ()=> !!(q('iframe[src*="challenges.cloudflare.com"]') || q('input[name="cf-turnstile-response"]'));
   const cfToken = ()=> (q('input[name="cf-turnstile-response"]')?.value||'').trim();
   function getErrorText(){
-    const nodes = qa('.alert--error, .alert.alert-danger, .msg-error, .alert-warning, .txt-msg-error, .flash-error');
+    const nodes = qa('.alert--error, .alert.alert-danger, .msg-error, .alert-warning, .alert.alert-warning, .txt-msg-error, .flash-error');
     let text=''; for (const n of nodes) text += ' ' + (n.textContent||'');
     return text.toLowerCase();
   }
+  function isAliasBanned(){ return /alias\s+est\s+banni/i.test(getErrorText()); }
   function isBannedError(){ return /banni|banned|utilisateur\s+.*banni|vous ne pouvez pas envoyer/i.test(getErrorText()); }
-  function hasVisibleError(){ return !!q('.alert--error, .alert.alert-danger, .msg-error, .alert-warning'); }
+  function hasVisibleError(){ return !!q('.alert--error, .alert.alert-danger, .msg-error, .alert-warning, .alert.alert-warning'); }
 
   async function handleCompose(cfg){
     await sleep(150+Math.random()*250);
@@ -743,6 +1125,11 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
     let pseudo =
       q('#destinataires .form-control-tag .label')?.childNodes?.[0]?.nodeValue?.trim() ||
       (qa('#destinataires input[name^="participants["]').map(i=>i.value)[0]??'') || '';
+
+    if(bannedRecipients.has(pseudo)){
+      log('Recipient banned – back to topic list.');
+      return { ok:false, pseudo, reason:'banned' };
+    }
 
     const generated = buildPersonalizedMessage(pseudo);
     if(!generated){
@@ -764,7 +1151,11 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
     await dwell(800,1400);
     q('.btn.btn-poster-msg.js-post-message, button[type="submit"]')?.click();
     await sleep(1200);
-
+    if (isAliasBanned()) {
+      log('Recipient banned – back to topic list.');
+      bannedRecipients.add(pseudo);
+      return { ok:false, pseudo, reason:'banned' };
+    }
     if (isBannedError()){
       log('Recipient banned → back to list.');
       return { ok:false, pseudo, reason:'banned' };
@@ -774,6 +1165,10 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
       await sleep(7000+Math.floor(Math.random()*6000));
       q('.btn.btn-poster-msg.js-post-message, button[type="submit"]')?.click();
       await sleep(1200);
+      if (isAliasBanned()) {
+        bannedRecipients.add(pseudo);
+        return { ok:false, pseudo, reason:'banned' };
+      }
       if (isBannedError()){
         return { ok:false, pseudo, reason:'banned' };
       }
@@ -790,7 +1185,7 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
   async function sessionStart(){
     await sessionGet();
         if(!myPseudo()){
-      log('Pseudo introuvable — session non démarrée.');
+      log('Username not found — session not started.');
       onCache=false;
       await set(STORE_ON,false);
       await updateSessionUI();
@@ -808,7 +1203,54 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
   async function sessionStop(){
     await sessionGet(); sessionCache.active=false; sessionCache.stopTs=NOW(); await set(STORE_SESSION,sessionCache);
     clearInterval(timerHandle); timerHandle=null;
-    await updateSessionUI().catch(console.error);
+    await updateSessionUI().catch(log);
+  }
+
+  async function switchToNextAccount(reason){
+    await ensureDefaults();
+    const cfg = Object.assign({}, DEFAULTS, await loadConf());
+    if(!Array.isArray(cfg.accounts) || cfg.accounts.length===0){
+      log('[switchToNextAccount] no accounts configured');
+      log('No accounts configured — nothing to switch.');
+      return;
+    }
+    const avatar = q('.headerAccount__link');
+    if(!avatar) return;
+    await humanHover(avatar);
+    avatar.click();
+    await dwell(400,800);
+    const logoutLink = q('.headerAccount__dropdownContainerBottom .headerAccount__button:last-child');
+    if(!logoutLink){
+      log('[switchToNextAccount] logout link not found');
+      log('Logout link not found — aborting rotation.');
+      return;
+    }
+    const current = (cfg.accountIdx || 0) % cfg.accounts.length;
+    const next = (current + 1) % cfg.accounts.length;
+    log(`[DM_WALKER] ${reason} → switching account from #${current} to #${next}`);
+    const currAcc = cfg.accounts[current];
+    if(currAcc?.user){
+      await set(`jvc_postwalker_cd_${currAcc.user}`, NOW());
+    }
+    cfg.accountIdx = next;
+    await saveConf(cfg);
+    try { await sessionGet(); }
+    catch (e) { log('sessionGet failed', e); }
+    sessionCache.mpCount = 0;
+    sessionCache.mpNextDelay = Math.floor(rnd(2,5));
+    sessionCache.dmSent = 0;
+    sessionCache.pendingDm = false;
+    sessionCache.cooldownUntil = 0;
+    await set(STORE_SESSION, sessionCache);
+    await updateSessionUI().catch(log);
+    await set(STORE_PENDING_LOGIN,true);
+    await humanHover(logoutLink);
+    await dwell();
+    logoutLink.click();
+    await new Promise(res=>{
+      const check=()=>{ if(/\/login/i.test(location.pathname)) res(); else setTimeout(check,200); };
+      check();
+    });
   }
   function formatHMS(ms){
     const sec=Math.floor(ms/1000);
@@ -839,10 +1281,25 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
       if(dmCountEl) dmCountEl.textContent = String(s.dmSent||0);
 
       const c = Object.assign({}, DEFAULTS, await loadConf());
-      const startEl = q('#jvc-dmwalker-active-start');
-      if(startEl) startEl.value = c.activeHours[0];
-      const endEl = q('#jvc-dmwalker-active-end');
-      if(endEl) endEl.value = c.activeHours[1];
+      const slots = (c.activeSlots && c.activeSlots.length)
+        ? c.activeSlots
+        : normalizeSlots([{start:c.activeHours[0]*60,end:c.activeHours[1]*60}]);
+      const badge = q('#jvc-dmwalker-badge');
+      if(badge){
+        if(onCache){
+          if(isNowInSlots(slots)){
+            badge.textContent = 'Active';
+          }else{
+            const ms = msUntilNextBoundary(slots);
+            const next = new Date(Date.now()+ms);
+            badge.textContent = `Snoozed ${pad2(next.getHours())}:${pad2(next.getMinutes())}`;
+          }
+        }else{
+          badge.textContent = 'MW';
+        }
+      }
+      const accSel = q('#jvc-dmwalker-account-select');
+      if(accSel) accSel.value = String(c.accountIdx||0);
     } finally {
       updating = false;
     }
@@ -850,24 +1307,80 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
   let timerHandle=null;
   let updating=false;
   let ticking = false;
-  function startTimerUpdater(){ if(timerHandle) clearInterval(timerHandle); timerHandle=setInterval(()=>{updateSessionUI().catch(console.error);},1000); updateSessionUI().catch(console.error); }
+  function startTimerUpdater(){ if(timerHandle) clearInterval(timerHandle); timerHandle=setInterval(()=>{updateSessionUI().catch(log);},1000); updateSessionUI().catch(log); }
+
+  function pad2(n){ return String(n).padStart(2,'0'); }
+  function hmToMin(hm){
+    if(typeof hm === 'number') return hm;
+    const [h,m] = String(hm).split(':').map(Number);
+    return h*60 + (m||0);
+  }
+  function minToHM(min){
+    const h = Math.floor(min/60)%24;
+    const m = min%60;
+    return `${pad2(h)}:${pad2(m)}`;
+  }
+  function normalizeSlots(slots){
+    if(!Array.isArray(slots)) return [];
+    const tmp=[];
+    for(const s of slots){
+      let start,end;
+      if(Array.isArray(s)){ [start,end]=s; }
+      else if(s && typeof s==='object'){ start=s.start; end=s.end; }
+      if(start===undefined || end===undefined) continue;
+      start=hmToMin(start); end=hmToMin(end);
+      if(isNaN(start)||isNaN(end)) continue;
+      start=(start%1440+1440)%1440; end=(end%1440+1440)%1440;
+      if(end<=start){
+        tmp.push({start,end:1440});
+        tmp.push({start:0,end});
+      }else tmp.push({start,end});
+    }
+    tmp.sort((a,b)=>a.start-b.start);
+    const out=[];
+    for(const s of tmp){
+      if(!out.length) out.push({...s});
+      else{
+        const last=out[out.length-1];
+        if(s.start<=last.end) last.end=Math.max(last.end,s.end);
+        else out.push({...s});
+      }
+    }
+    return out;
+  }
+  function isNowInSlots(slots){
+    const norm=normalizeSlots(slots);
+    const now=new Date();
+    const m=now.getHours()*60+now.getMinutes();
+    return norm.some(s=>m>=s.start && m<s.end);
+  }
+  function msUntilNextBoundary(slots){
+    const norm=normalizeSlots(slots);
+    if(!norm.length) return 0;
+    const now=new Date();
+    const m=now.getHours()*60+now.getMinutes();
+    let best=1440;
+    for(const s of norm){
+      if(m < s.start) best=Math.min(best, s.start - m);
+      else if(m>=s.start && m<s.end) best=Math.min(best, s.end - m);
+      else best=Math.min(best, s.start + 1440 - m);
+    }
+    return best*60*1000;
+  }
 
   /* ---------- scheduler ---------- */
   async function tickSoon(ms=300){
     const cfg = Object.assign({}, DEFAULTS, await loadConf());
-    const [startHour,endHour]=cfg.activeHours;
-    const now=new Date();
-    const h=now.getHours();
-    if(h<startHour||h>=endHour){
+    let slots = cfg.activeSlots && cfg.activeSlots.length ? cfg.activeSlots : normalizeSlots([{start:cfg.activeHours[0]*60,end:cfg.activeHours[1]*60}]);
+    if(!slots.length){ setTimeout(()=>{ tick().catch(log); }, ms); return; }
+    if(!isNowInSlots(slots)){
       await sessionStop();
-      const next=new Date(now);
-      if(h>=endHour) next.setDate(next.getDate()+1);
-      next.setHours(startHour,0,0,0);
-      const delay=next.getTime()-now.getTime();
-      setTimeout(()=>{ tickSoon(ms).catch(console.error); }, delay);
+      const delay = msUntilNextBoundary(slots);
+      setTimeout(()=>{ tickSoon(ms).catch(log); }, delay);
       return;
     }
-    setTimeout(() => { tick().catch(console.error); }, ms);
+    await sessionStart();
+    setTimeout(()=>{ tick().catch(log); }, ms);
   }
   async function tick(){
     if (ticking) return;
@@ -890,6 +1403,13 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
     if(isCompose()){
       log('Compose detected → sending…');
       const res=await handleCompose(cfg);
+      if(res.reason === 'banned'){
+        const back = normalizeListToPageOne(await get(STORE_LAST_LIST,'') || pickListWeighted());
+        await dwell(200,500);
+        location.href = back;
+        tickSoon(300);
+        return;
+      }
       if(res.ok){
         log('MP sent.');
         await sessionGet();
@@ -933,11 +1453,17 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
 
       const atLast = await ensureAtLastPage();
       await dwell(800,2000);
-      await randomScrollWait(3000,7000);
-      await randomScrollWait(2000,6000);
-      await randomScrollWait(2000,4000);
+      await readingScroll();
       const pseudo=await pickRandomEligiblePseudo(cfg, 6000);
-      if(!pseudo){ log('No eligible user (cooldown/blacklist). Back to list.'); history.back(); return; }
+      if(!pseudo){
+        log('No eligible user (cooldown/blacklist). Back to list.');
+        let back = await get(STORE_LAST_LIST, '') || pickListWeighted();
+        back = normalizeListToPageOne(back);
+        await dwell(200,600);
+        location.href = back;
+        tickSoon(300);
+        return;
+      }
 
       log(`Chosen random target → ${pseudo}`);
       await dwell(400,1200);
@@ -945,7 +1471,7 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
         const msg=q('.bloc-message-forum');
         if(msg) await humanHover(msg);
         else window.scrollBy({top:rnd(-120,120),behavior:'smooth'});
-      }catch(e){ console.error('[nav mimic]', e); }
+      }catch(e){ log('[nav mimic]', e); }
       const url=`${ORIG}/messages-prives/nouveau.php?all_dest=${encodeURIComponent(pseudo)}`;
       location.href=url;
       return;
@@ -1003,7 +1529,7 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
       const href=a.getAttribute('href')||'';
       if(/\/messages-prives\//i.test(href)) continue;
       let abs, info;
-      try{ abs=new URL(href,ORIG).href; info=getInfoFromHref(abs); }catch(e){ console.error('[collectTopicLinks] URL parse', e); continue; }
+      try{ abs=new URL(href,ORIG).href; info=getInfoFromHref(abs); }catch(e){ log('[collectTopicLinks] URL parse', e); continue; }
       if(!info || !ALLOWED_FORUMS.has(info.forumId||'')) continue;
       if(seen.has(abs)) continue;
       seen.add(abs); out.push(a);
@@ -1017,7 +1543,19 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
 
   /* ---------- robust compact English UI ---------- */
   (async function buildAndAutoStart(){
-    const tryUI=async()=>{ try{ await ensureUI(); }catch(e){ console.error('[DM Walker] UI error', e); } };
+    const tryUI=async()=>{
+      try{
+        await ensureUI();
+      }catch(e){
+        log('[DM Walker] UI error', e);
+        if(!uiRemountTimeout){
+          uiRemountTimeout=setTimeout(async ()=>{
+            uiRemountTimeout=null;
+            await tryUI();
+          },2000);
+        }
+      }
+    };
     if (document.readyState === 'loading'){ document.addEventListener('DOMContentLoaded', tryUI, {once:true}); }
     else { await tryUI(); }
     let retries=0;
@@ -1042,14 +1580,10 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
     const c=Object.assign({}, DEFAULTS, await loadConf());
     const pseudo = myPseudo();
     if(!pseudo){
-      log('Pseudo introuvable — démarrage annulé.');
+      log('Username not found — start canceled.');
       return;
     }
     const startEl=q('#jvc-dmwalker-active-start');
-    const endEl=q('#jvc-dmwalker-active-end');
-    const start=parseInt(startEl?startEl.value:c.activeHours[0],10);
-    const end=parseInt(endEl?endEl.value:c.activeHours[1],10);
-    await saveConf({ ...c, me:pseudo, activeHours:[start,end] });
     await set(STORE_ON,true);
     onCache = true;
     await sessionStart();
@@ -1122,23 +1656,242 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
     stopBtn.addEventListener('click', stopHandler);
     purgeBtn.addEventListener('click', purgeHandler);
 
-    const hoursWrap=document.createElement('div');
-    Object.assign(hoursWrap.style,{display:'flex',alignItems:'center',gap:'4px',margin:'6px 0'});
-    const hoursLabel=document.createElement('span');
-    hoursLabel.textContent='Heures actives';
-    const startInput=document.createElement('input');
-    startInput.type='number';
-    startInput.id='jvc-dmwalker-active-start';
-    startInput.value=conf.activeHours[0];
-    startInput.min='0'; startInput.max='24';
-    Object.assign(startInput.style,{width:'40px',background:'#0b0d12',color:'#eee',border:'1px solid #222',borderRadius:'4px'});
-    const endInput=document.createElement('input');
-    endInput.type='number';
-    endInput.id='jvc-dmwalker-active-end';
-    endInput.value=conf.activeHours[1];
-    endInput.min='0'; endInput.max='24';
-    Object.assign(endInput.style,{width:'40px',background:'#0b0d12',color:'#eee',border:'1px solid #222',borderRadius:'4px'});
-    hoursWrap.append(hoursLabel,startInput,endInput);
+    // --- Slots UI (24h pickers, no "Active slots" label) ---
+
+    const slotsWrap = document.createElement('div');
+    Object.assign(slotsWrap.style, { display: 'flex', flexDirection: 'column', gap: '4px', margin: '6px 0' });
+
+    // NO LABEL: keep "Active slots" removed on purpose
+
+    const slotsList = document.createElement('div');
+    slotsList.id = 'jvc-dmwalker-slots-list';
+    Object.assign(slotsList.style, { display: 'flex', flexDirection: 'column', gap: '4px' });
+
+    // Build a 24h time picker (HH:MM) with two <select>, no locale issues
+    function createTimePicker(initialHM) {
+      const wrap = document.createElement('div');
+      Object.assign(wrap.style, { display: 'inline-flex', gap: '4px', alignItems: 'center' });
+
+      const selH = document.createElement('select');
+      const selM = document.createElement('select');
+      Object.assign(selH.style, { flex: '1', background: '#0b0d12', color: '#eee', border: '1px solid #222', borderRadius: '4px' });
+      Object.assign(selM.style, { flex: '1', background: '#0b0d12', color: '#eee', border: '1px solid #222', borderRadius: '4px' });
+
+      for (let h = 0; h < 24; h++) {
+        const o = document.createElement('option');
+        o.value = pad2(h); o.textContent = pad2(h);
+        selH.appendChild(o);
+      }
+      for (let m = 0; m < 60; m++) {
+        const o = document.createElement('option');
+        o.value = pad2(m); o.textContent = pad2(m);
+        selM.appendChild(o);
+      }
+
+      let mins = hmToMin(initialHM || '01:00'); // uses existing hmToMin from the script
+      if (Number.isNaN(mins)) mins = hmToMin('01:00');
+      selH.value = pad2(Math.floor(mins / 60));
+      selM.value = pad2(mins % 60);
+
+      wrap.append(selH, document.createTextNode(':'), selM);
+
+      return {
+        el: wrap,
+        get() { return `${selH.value}:${selM.value}`; },
+        set(v) {
+          const t = hmToMin(v);
+          if (!Number.isNaN(t)) {
+            selH.value = pad2(Math.floor(t / 60));
+            selM.value = pad2(t % 60);
+          }
+        }
+      };
+    }
+
+    function addSlotRow(start = '08:00', end = '23:00') {
+      const row = document.createElement('div');
+      Object.assign(row.style, { display: 'flex', alignItems: 'center', gap: '6px' });
+
+      const startPicker = createTimePicker(start);
+      const endPicker = createTimePicker(end);
+
+      const del = document.createElement('button');
+      del.textContent = 'Del';
+      Object.assign(del.style, { background: '#8a2020', border: '0', color: '#fff', padding: '1px 4px', borderRadius: '4px', cursor: 'pointer' });
+      del.addEventListener('click', () => row.remove());
+
+      // expose a getter for Save
+      row._get = () => ({ start: startPicker.get(), end: endPicker.get() });
+
+      row.append(startPicker.el, document.createTextNode('—'), endPicker.el, del);
+      slotsList.appendChild(row);
+    }
+
+    function renderSlots() {
+      slotsList.innerHTML = '';
+      const base = (conf.activeSlots && conf.activeSlots.length)
+        ? conf.activeSlots
+        : normalizeSlots([{ start: conf.activeHours[0] * 60, end: conf.activeHours[1] * 60 }]);
+      if (base.length) {
+        base.forEach(sl => addSlotRow(minToHM(sl.start), minToHM(sl.end)));
+      } else {
+        addSlotRow();
+      }
+    }
+
+    renderSlots();
+
+    const addSlotBtn = document.createElement('button');
+    addSlotBtn.textContent = 'Add';
+    Object.assign(addSlotBtn.style, { background: '#2a6ef5', border: '0', color: '#fff', padding: '2px 6px', borderRadius: '6px', cursor: 'pointer' });
+    addSlotBtn.addEventListener('click', () => addSlotRow());
+
+    const saveSlotBtn = document.createElement('button');
+    saveSlotBtn.textContent = 'Save';
+    Object.assign(saveSlotBtn.style, { background: '#2a6ef5', border: '0', color: '#fff', padding: '2px 6px', borderRadius: '6px', cursor: 'pointer' });
+    saveSlotBtn.addEventListener('click', async () => {
+      const rows = qa('#jvc-dmwalker-slots-list > div');
+      const raw = rows.map(r => r._get ? r._get() : { start: '08:00', end: '23:00' });
+      const norm = normalizeSlots(raw);
+      conf.activeSlots = norm;
+      if (norm.length) {
+        conf.activeHours = [ Math.floor(norm[0].start / 60), Math.floor(norm[0].end / 60) ];
+      }
+      await saveConf(conf);
+      renderSlots();
+      await updateSessionUI();
+    });
+
+    const resetSlotBtn = document.createElement('button');
+    resetSlotBtn.textContent = 'Reset';
+    Object.assign(resetSlotBtn.style, { background: '#333', border: '1px solid #555', color: '#bbb', padding: '2px 6px', borderRadius: '6px', cursor: 'pointer' });
+    resetSlotBtn.addEventListener('click', () => renderSlots());
+
+    const btnRow = document.createElement('div');
+    Object.assign(btnRow.style, { display: 'flex', gap: '4px' });
+    btnRow.append(addSlotBtn, saveSlotBtn, resetSlotBtn);
+
+    // Append the rebuilt 24h-only UI (still no "Active slots" label)
+    slotsWrap.append(slotsList, btnRow);
+
+    const accountWrap=document.createElement('div');
+    Object.assign(accountWrap.style,{display:'flex',alignItems:'center',gap:'4px',margin:'6px 0'});
+    const accountLabel=document.createElement('span');
+    accountLabel.textContent='Account';
+    const accountSelect=document.createElement('select');
+    accountSelect.id='jvc-dmwalker-account-select';
+    Object.assign(accountSelect.style,{flex:'1',background:'#0b0d12',color:'#eee',border:'1px solid #222',borderRadius:'4px'});
+    (conf.accounts||[]).forEach((acc,i)=>{
+      const opt=document.createElement('option');
+      opt.value=String(i);
+      opt.textContent=acc.user;
+      accountSelect.appendChild(opt);
+    });
+    accountSelect.value=String(conf.accountIdx||0);
+    accountSelect.addEventListener('change', async ()=>{
+      const idx=parseInt(accountSelect.value,10)||0;
+      conf.accountIdx = idx;
+      const c=Object.assign({}, DEFAULTS, await loadConf());
+      c.accountIdx=idx;
+      await saveConf(c);
+      await updateSessionUI();
+    });
+    const addAccBtn=document.createElement('button');
+    addAccBtn.textContent='Add account';
+    addAccBtn.title='Add or edit accounts';
+    Object.assign(addAccBtn.style,{background:'#2a6ef5',border:'0',color:'#fff',padding:'2px 6px',borderRadius:'6px',cursor:'pointer'});
+    accountWrap.append(accountLabel,accountSelect,addAccBtn);
+
+    const accountMgr=document.createElement('div');
+    Object.assign(accountMgr.style,{display:'none',flexDirection:'column',gap:'4px',margin:'4px 0',padding:'4px',background:'#0b0d12',border:'1px solid #222',borderRadius:'8px'});
+    const accList=document.createElement('div');
+    Object.assign(accList.style,{display:'flex',flexDirection:'column',gap:'2px',maxHeight:'70px',overflowY:'auto'});
+    const form=document.createElement('div');
+    Object.assign(form.style,{display:'flex',gap:'4px'});
+    const userInput=document.createElement('input');
+    userInput.placeholder='username';
+    Object.assign(userInput.style,{flex:'1',background:'#0b0d12',color:'#eee',border:'1px solid #222',borderRadius:'4px'});
+    const passInput=document.createElement('input');
+    passInput.type='password';
+    passInput.placeholder='password';
+    Object.assign(passInput.style,{flex:'1',background:'#0b0d12',color:'#eee',border:'1px solid #222',borderRadius:'4px'});
+    const saveAccBtn=document.createElement('button');
+    saveAccBtn.textContent='Save';
+    saveAccBtn.title='Click Save or press Enter to confirm';
+    Object.assign(saveAccBtn.style,{background:'#2a6ef5',border:'0',color:'#fff',padding:'2px 6px',borderRadius:'6px',cursor:'pointer'});
+    const handleEnterToSave = e => { if(e.key==='Enter'){ e.preventDefault(); saveAccBtn.click(); } };
+    userInput.addEventListener('keydown', handleEnterToSave);
+    passInput.addEventListener('keydown', handleEnterToSave);
+    form.append(userInput,passInput,saveAccBtn);
+    accountMgr.append(accList,form);
+    let editIdx=-1;
+    function refreshAccountSelect(){
+      accountSelect.innerHTML='';
+      (conf.accounts||[]).forEach((acc,i)=>{
+        const opt=document.createElement('option');
+        opt.value=String(i);
+        opt.textContent=acc.user;
+        accountSelect.appendChild(opt);
+      });
+      if(conf.accountIdx>=conf.accounts.length) conf.accountIdx=0;
+      accountSelect.value=String(conf.accountIdx||0);
+    }
+    function populateAccList(){
+      accList.innerHTML='';
+      (conf.accounts||[]).forEach((acc,i)=>{
+        const row=document.createElement('div');
+        Object.assign(row.style,{display:'flex',alignItems:'center',gap:'4px'});
+        const name=document.createElement('span');
+        name.textContent=acc.user;
+        Object.assign(name.style,{flex:'1'});
+        const editBtn=document.createElement('button');
+        editBtn.textContent='Edit';
+        Object.assign(editBtn.style,{background:'#555',border:'0',color:'#fff',padding:'1px 4px',borderRadius:'4px',cursor:'pointer'});
+        editBtn.addEventListener('click',()=>{ userInput.value=acc.user; passInput.value=acc.pass||''; editIdx=i; });
+        const delBtn=document.createElement('button');
+        delBtn.textContent='Del';
+        Object.assign(delBtn.style,{background:'#8a2020',border:'0',color:'#fff',padding:'1px 4px',borderRadius:'4px',cursor:'pointer'});
+        delBtn.addEventListener('click',async ()=>{
+          conf.accounts.splice(i,1);
+          if(conf.accountIdx>=conf.accounts.length) conf.accountIdx=0;
+          await saveConf(conf);
+          refreshAccountSelect();
+          populateAccList();
+          await updateSessionUI();
+        });
+        row.append(name,editBtn,delBtn);
+        accList.appendChild(row);
+      });
+    }
+    addAccBtn.addEventListener('click',()=>{
+      accountMgr.style.display=accountMgr.style.display==='none'?'flex':'none';
+      if(accountMgr.style.display!=='none'){ populateAccList(); log('Enter username and password then Save. Click Edit to modify or Del to remove.'); }
+    });
+    saveAccBtn.addEventListener('click',async ()=>{
+      const u=userInput.value.trim(), p=passInput.value;
+      if(!u){ log('User required.'); return; }
+      if(conf.accounts.some(a=>a.user===u && editIdx===-1)){
+        log('Account already exists.');
+        const existingIdx = conf.accounts.findIndex(a=>a.user===u);
+        if(existingIdx!==-1){
+          const row = accList.children[existingIdx];
+          if(row){ row.style.outline='1px solid #2a6ef5'; row.scrollIntoView({block:'center'}); setTimeout(()=>row.style.outline='',1000); }
+          userInput.value = conf.accounts[existingIdx].user;
+          passInput.value = conf.accounts[existingIdx].pass || '';
+          editIdx = existingIdx;
+        }
+        return;
+      }
+      if(editIdx>=0) conf.accounts[editIdx]=p?{user:u,pass:p}:{user:u};
+      else conf.accounts.push(p?{user:u,pass:p}:{user:u});
+      editIdx=-1;
+      userInput.value=''; passInput.value='';
+      await saveConf(conf);
+      refreshAccountSelect();
+      populateAccList();
+      await updateSessionUI();
+      log('Account saved');
+    });
 
     const chronoWrap=document.createElement('div');
     Object.assign(chronoWrap.style,{display:'flex',alignItems:'center',gap:'4px',marginBottom:'4px',fontVariantNumeric:'tabular-nums'});
@@ -1154,16 +1907,18 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
     dmCountEl=dmCount;
     chronoWrap.append(chronoLabel, chrono, document.createTextNode(' | DMs: '), dmCount);
 
-    const log=document.createElement('div');
-    log.id='jvc-dmwalker-log';
-    Object.assign(log.style,{
-      marginTop:'2px',color:'#9ecbff',lineHeight:'1.4',height:'5.6em',
-      overflow:'auto',whiteSpace:'pre-wrap',background:'#0b0d12',
-      border:'1px solid #222',borderRadius:'8px',padding:'6px'
-    });
-    logEl=log;
-
-    box.append(header,actions,hoursWrap,chronoWrap,log);
+      box.append(header,actions,slotsWrap,accountWrap,accountMgr,chronoWrap);
+      if(DEBUG){
+      const log=document.createElement('div');
+        log.id='jvc-dmwalker-log';
+        Object.assign(log.style,{
+          marginTop:'2px',color:'#9ecbff',lineHeight:'1.4',height:'5.6em',
+          overflow:'auto',whiteSpace:'pre-wrap',background:'#0b0d12',
+          border:'1px solid #222',borderRadius:'8px',padding:'6px'
+        });
+        logEl=log;
+        box.append(log);
+      }
 
     const parent=document.body||document.documentElement;
     parent.appendChild(box);
@@ -1203,7 +1958,7 @@ C’est gratos et t’encaisses par virement ou paypal https://image.noelshack.c
           uiRemountTimeout=setTimeout(async ()=>{
             uiRemountTimeout=null;
             try{ await ensureUI(); }
-            catch(e){ console.error('UI remount failed',e); }
+            catch(e){ log('UI remount failed',e); }
           },50);
         }
       }
